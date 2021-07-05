@@ -703,6 +703,15 @@ struct usbi_interface_descriptor {
 	uint8_t  iInterface;
 } LIBUSB_PACKED;
 
+struct usbi_endpoint_descriptor {
+	uint8_t  bLength;
+	uint8_t  bDescriptorType;
+	uint8_t  bEndpointAddress;
+	uint8_t  bmAttributes;
+	uint16_t wMaxPacketSize;
+	uint8_t  bInterval;
+} LIBUSB_PACKED;
+
 struct usbi_string_descriptor {
 	uint8_t  bLength;
 	uint8_t  bDescriptorType;
@@ -847,8 +856,11 @@ struct usbi_option {
   union {
     int ival;
     libusb_log_cb log_cbval;
+    void *pval;
   } arg;
 };
+
+extern struct usbi_option default_context_options[LIBUSB_OPTION_MAX];
 
 /* OS event abstraction */
 

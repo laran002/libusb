@@ -47,7 +47,11 @@ static int default_context_refcnt;
 static usbi_atomic_t default_debug_level = -1;
 #endif
 static usbi_mutex_static_t default_context_lock = USBI_MUTEX_INITIALIZER;
-static struct usbi_option default_context_options[LIBUSB_OPTION_MAX];
+/* Not static: the Android JNI backend (linux_usbfs.c's op_set_option())
+ * reaches into this directly to convert and cache a process-wide JavaVM*
+ * whenever LIBUSB_OPTION_ANDROID_JNIENV/_JAVAVM is set -- see libusb.h's
+ * docs on those options. */
+struct usbi_option default_context_options[LIBUSB_OPTION_MAX];
 
 
 usbi_mutex_static_t active_contexts_lock = USBI_MUTEX_INITIALIZER;
@@ -2454,6 +2458,7 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 {
 	int arg = 0, r = LIBUSB_SUCCESS;
 	libusb_log_cb log_cb = NULL;
+	void *ptrarg = NULL;
 	va_list ap;
 #if defined(ENABLE_LOGGING) && !defined(ENABLE_DEBUG_LOGGING)
 	int is_default_context = (NULL == ctx);
@@ -2469,6 +2474,19 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 	}
 	if (LIBUSB_OPTION_LOG_CB == option) {
 		log_cb = (libusb_log_cb) va_arg(ap, libusb_log_cb);
+	}
+	if (LIBUSB_OPTION_ANDROID_JNIENV == option || LIBUSB_OPTION_ANDROID_JAVAVM == option) {
+		/* Peek the pointer via a copy of ap: it still needs to reach
+		 * usbi_backend.set_option() untouched below (that's what
+		 * actually consumes it), but it also needs to be recorded in
+		 * default_context_options for replay against contexts created
+		 * later -- see "apply default options to all new contexts" in
+		 * libusb_init_context().
+		 */
+		va_list ap_peek;
+		va_copy(ap_peek, ap);
+		ptrarg = va_arg(ap_peek, void *);
+		va_end(ap_peek);
 	}
 
 	do {
@@ -2489,6 +2507,8 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 			} else if (LIBUSB_OPTION_LOG_CB == option) {
 				default_context_options[option].arg.log_cbval = log_cb;
 				libusb_set_log_cb_internal(NULL, log_cb, LIBUSB_LOG_CB_GLOBAL);
+			} else if (LIBUSB_OPTION_ANDROID_JNIENV == option || LIBUSB_OPTION_ANDROID_JAVAVM == option) {
+				default_context_options[option].arg.pval = ptrarg;
 			}
 			usbi_mutex_static_unlock(&default_context_lock);
 		}
@@ -2511,6 +2531,8 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 			/* Handle all backend-specific options here */
 		case LIBUSB_OPTION_USE_USBDK:
 		case LIBUSB_OPTION_NO_DEVICE_DISCOVERY:
+		case LIBUSB_OPTION_ANDROID_JNIENV:
+		case LIBUSB_OPTION_ANDROID_JAVAVM:
 			if (usbi_backend.set_option) {
 				r = usbi_backend.set_option(ctx, option, ap);
 				break;
@@ -2629,10 +2651,12 @@ int API_EXPORTED libusb_init_context(libusb_context **ctx, const struct libusb_i
 		if (LIBUSB_OPTION_LOG_LEVEL == option || !default_context_options[option].is_set) {
 			continue;
 		}
-		if (LIBUSB_OPTION_LOG_CB != option) {
-			r = libusb_set_option(_ctx, option);
-		} else {
+		if (LIBUSB_OPTION_LOG_CB == option) {
 			r = libusb_set_option(_ctx, option, default_context_options[option].arg.log_cbval);
+		} else if (LIBUSB_OPTION_ANDROID_JNIENV == option || LIBUSB_OPTION_ANDROID_JAVAVM == option) {
+			r = libusb_set_option(_ctx, option, default_context_options[option].arg.pval);
+		} else {
+			r = libusb_set_option(_ctx, option);
 		}
 		if (LIBUSB_SUCCESS != r)
 			goto err_free_ctx;

@@ -2494,7 +2494,14 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 		}
 
 		ctx = usbi_get_context(ctx);
-		if (NULL == ctx)
+		/* ANDROID_JNIENV/_JAVAVM must reach the backend even before any
+		 * context exists yet (qusb's own usage: libusb_set_option(NULL,
+		 * LIBUSB_OPTION_ANDROID_JNIENV, ...) runs before libusb_init()) --
+		 * the JavaVM* is process-wide, not per-context, so the backend
+		 * caches it itself (see linux_usbfs.c's op_set_option()) rather
+		 * than relying on a context to store it against.
+		 */
+		if (NULL == ctx && LIBUSB_OPTION_ANDROID_JNIENV != option && LIBUSB_OPTION_ANDROID_JAVAVM != option)
 			break;
 
 		switch (option) {
@@ -2511,6 +2518,8 @@ int API_EXPORTEDV libusb_set_option(libusb_context *ctx,
 			/* Handle all backend-specific options here */
 		case LIBUSB_OPTION_USE_USBDK:
 		case LIBUSB_OPTION_NO_DEVICE_DISCOVERY:
+		case LIBUSB_OPTION_ANDROID_JNIENV:
+		case LIBUSB_OPTION_ANDROID_JAVAVM:
 			if (usbi_backend.set_option) {
 				r = usbi_backend.set_option(ctx, option, ap);
 				break;
@@ -2627,6 +2636,13 @@ int API_EXPORTED libusb_init_context(libusb_context **ctx, const struct libusb_i
 	/* apply default options to all new contexts */
 	for (enum libusb_option option = 0 ; option < LIBUSB_OPTION_MAX ; option++) {
 		if (LIBUSB_OPTION_LOG_LEVEL == option || !default_context_options[option].is_set) {
+			continue;
+		}
+		/* ANDROID_JNIENV/_JAVAVM are process-wide (one JVM per process),
+		 * not per-context -- the backend already cached the JavaVM* the
+		 * moment libusb_set_option() first passed it through (see the
+		 * ctx == NULL carve-out above), so there is nothing to replay. */
+		if (LIBUSB_OPTION_ANDROID_JNIENV == option || LIBUSB_OPTION_ANDROID_JAVAVM == option) {
 			continue;
 		}
 		if (LIBUSB_OPTION_LOG_CB != option) {

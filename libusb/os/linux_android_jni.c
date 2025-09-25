@@ -484,7 +484,7 @@ int android_jni_request_permission(struct android_jni_context *jni,
 	permission_intent =
 		(*jni_env)->CallStaticObjectMethod(jni_env,
 			jni->PendingIntent, jni->PendingIntent__getBroadcast,
-			jni->application_context, 0, intent, 0);
+			jni->application_context, 0, intent, 33554432);
 
 	(*jni_env)->DeleteLocalRef(jni_env, intent);
 

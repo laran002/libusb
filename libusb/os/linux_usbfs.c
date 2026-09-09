@@ -554,6 +554,25 @@ static int op_get_device_string(struct libusb_device *dev,
 
 #ifdef __ANDROID__
 
+/* linux_enumerate_device() (called below, per discovered device) only ever
+ * adds to a context's device list: it looks a device up by session_id
+ * (busnum<<8|devaddr) and, if found, silently reuses the existing cached
+ * libusb_device -- stale permission/descriptor state and all -- instead of
+ * treating it as newly arrived. On real Linux, a device that disappears is
+ * reported via linux_device_disconnected(), called from a separate
+ * netlink/udev hotplug thread; that thread doesn't exist on Android, so
+ * nothing ever calls it for devices discovered this way. A device that's
+ * physically unplugged and replugged commonly gets the same busnum:devaddr
+ * back (a single Android USB host port has nowhere else to go), so libusb
+ * silently hands back the stale pre-permission object instead of
+ * re-running the permission flow -- and a device that's simply removed for
+ * good is never noticed at all. Diff against this context's own device
+ * list (the actual source of truth for "known before this scan") and
+ * report anything that didn't show up this time as gone, the same way the
+ * real hotplug thread would.
+ */
+#define ANDROID_JNI_MAX_TRACKED_DEVICES 256
+
 static int android_jni_scan_devices(struct libusb_context *ctx)
 {
 	/* Access and use the Android API via jni_env */
@@ -564,6 +583,31 @@ static int android_jni_scan_devices(struct libusb_context *ctx)
 	struct android_jni_devices *devices;
 	jobject device;
 	uint8_t busnum, devaddr;
+
+	struct {
+		uint8_t busnum;
+		uint8_t devaddr;
+		unsigned char seen;
+	} known[ANDROID_JNI_MAX_TRACKED_DEVICES];
+	unsigned int known_count = 0;
+	unsigned int i;
+
+	{
+		struct libusb_device *dev;
+
+		usbi_mutex_lock(&ctx->usb_devs_lock);
+		for_each_device(ctx, dev) {
+			if (!usbi_atomic_load(&dev->attached))
+				continue;
+			if (known_count >= ANDROID_JNI_MAX_TRACKED_DEVICES)
+				break;
+			known[known_count].busnum = dev->bus_number;
+			known[known_count].devaddr = dev->device_address;
+			known[known_count].seen = 0;
+			known_count++;
+		}
+		usbi_mutex_unlock(&ctx->usb_devs_lock);
+	}
 
 	r = android_jni_detect_usbhost(cpriv->android_jni, &has_usbhost);
 
@@ -589,10 +633,24 @@ static int android_jni_scan_devices(struct libusb_context *ctx)
 		if (linux_enumerate_device(ctx, busnum, devaddr, NULL) < 0)
 			usbi_dbg(ctx, "failed to enumerate android device %d/%d", busnum, devaddr);
 
+		for (i = 0; i < known_count; i++) {
+			if (known[i].busnum == busnum && known[i].devaddr == devaddr) {
+				known[i].seen = 1;
+				break;
+			}
+		}
+
 		android_jni_globalunref(cpriv->android_jni, device);
 	}
 
 	android_jni_devices_free(devices);
+
+	/* Anything still unseen was known before this scan but didn't show
+	 * up in it this time -- gone. */
+	for (i = 0; i < known_count; i++) {
+		if (!known[i].seen)
+			linux_device_disconnected(known[i].busnum, known[i].devaddr);
+	}
 
 	return LIBUSB_SUCCESS;
 }
@@ -697,6 +755,30 @@ static int linux_scan_devices(struct libusb_context *ctx)
 static void op_hotplug_poll(void)
 {
 	linux_hotplug_poll();
+
+#ifdef __ANDROID__
+	/* linux_hotplug_poll() above is a no-op on Android (see
+	 * linux_usbfs.h): it only drives the netlink/udev hotplug thread,
+	 * which doesn't exist here. android_jni_scan_devices() is otherwise
+	 * only ever called once, from op_init() -- without this, nothing on
+	 * Android would ever notice a device attached or detached after
+	 * startup at all. libusb_get_device_list() already calls this hook
+	 * on every call (this backend unconditionally reports
+	 * LIBUSB_CAP_HAS_HOTPLUG), so this is what actually gives Android a
+	 * working per-poll rescan.
+	 */
+	{
+		struct libusb_context *ctx;
+
+		usbi_mutex_static_lock(&active_contexts_lock);
+		for_each_context(ctx) {
+			struct linux_context_priv *cpriv = usbi_get_context_priv(ctx);
+			if (cpriv->android_jni)
+				android_jni_scan_devices(ctx);
+		}
+		usbi_mutex_static_unlock(&active_contexts_lock);
+	}
+#endif
 }
 
 static int open_sysfs_attr(struct libusb_context *ctx,

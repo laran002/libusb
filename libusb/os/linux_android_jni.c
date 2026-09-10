@@ -525,6 +525,23 @@ int android_jni_connect(struct android_jni_context *jni,
 		(*jni_env)->CallObjectMethod(jni_env,
 			jni->usb_manager, jni->UsbManager_openDevice, device);
 
+	/* openDevice() throws (rather than returning null) when the device has
+	   already vanished by the time we get here -- e.g. a physical unplug
+	   racing this call. A pending exception makes any further JNI call
+	   (the very next one, getFileDescriptor() below) illegal per the JNI
+	   spec; with CheckJNI on (the default in dev/debug builds) that's a
+	   fatal, uncatchable abort ("JNI DETECTED ERROR IN APPLICATION"), not
+	   a normal Java exception we could catch on that side. Must be
+	   cleared here before making any other JNI call. */
+	if ((*jni_env)->ExceptionCheck(jni_env)) {
+		(*jni_env)->ExceptionClear(jni_env);
+		return LIBUSB_ERROR_NO_DEVICE;
+	}
+
+	if (!local_connection) {
+		return LIBUSB_ERROR_NO_DEVICE;
+	}
+
 	/* fd output */
 	/* fd = local_connection.getFileDescriptor(); */
 	*fd =

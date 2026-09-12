@@ -62,6 +62,7 @@ struct android_jni_context
 	jmethodID Iterator_hasNext, Iterator_next;
 
 	int Build__VERSION__SDK_INT;
+	int Build__VERSION_CODES__M;
 	int Build__VERSION_CODES__P;
 	jmethodID Intent_init;
 	jmethodID PackageManager_hasSystemFeature;
@@ -468,10 +469,25 @@ int android_jni_request_permission(struct android_jni_context *jni,
 	int r;
 	JNIEnv *jni_env;
 	jobject intent, permission_intent;
+	jint permission_intent_flags = 0;
 
 	r = android_jni_env(jni, &jni_env);
 	if (r != LIBUSB_SUCCESS)
 		return r;
+
+	/* From API 31 (S) onwards, PendingIntent.getBroadcast() requires
+	 * either FLAG_IMMUTABLE or FLAG_MUTABLE to be set, or it throws.
+	 * FLAG_IMMUTABLE itself only exists since API 23 (M); look it up by
+	 * reflection instead of hardcoding its value so this still runs on
+	 * pre-M devices, where passing 0 is correct. */
+	if (jni->Build__VERSION__SDK_INT >= jni->Build__VERSION_CODES__M) {
+		jfieldID flag_immutable_field_id = (*jni_env)->GetStaticFieldID(
+			jni_env, jni->PendingIntent, "FLAG_IMMUTABLE", "I");
+		if (flag_immutable_field_id != NULL) {
+			permission_intent_flags = (*jni_env)->GetStaticIntField(
+				jni_env, jni->PendingIntent, flag_immutable_field_id);
+		}
+	}
 
 	/* Intent intent = new Intent(permission_action); */
 	intent =
@@ -480,11 +496,11 @@ int android_jni_request_permission(struct android_jni_context *jni,
 			jni->permission_action);
 
 	/* PendingIntent permission_intent =
-		PendingIntent.getBroadcast(application_context, 0, intent, 0); */
+		PendingIntent.getBroadcast(application_context, 0, intent, permission_intent_flags); */
 	permission_intent =
 		(*jni_env)->CallStaticObjectMethod(jni_env,
 			jni->PendingIntent, jni->PendingIntent__getBroadcast,
-			jni->application_context, 0, intent, 33554432);
+			jni->application_context, 0, intent, permission_intent_flags);
 
 	(*jni_env)->DeleteLocalRef(jni_env, intent);
 
@@ -789,6 +805,7 @@ static int android_jni_fill_ctx_ids(struct android_jni_context *jni,
 			Build__VERSION,
 			(*jni_env)->GetStaticFieldID(jni_env,
 				Build__VERSION, "SDK_INT", "I"));
+	jni->Build__VERSION_CODES__M = 23;
 	jni->Build__VERSION_CODES__P = 28;
 
 	Intent = (*jni_env)->FindClass(jni_env, "android/content/Intent");

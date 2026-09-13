@@ -1675,8 +1675,27 @@ static int op_open(struct libusb_device_handle *handle)
 
 #ifdef __ANDROID__
 	struct linux_device_priv *priv = usbi_get_device_priv(handle->dev);
-	if (priv->android_jni_device != NULL)
+	if (priv->android_jni_device != NULL) {
 		fd = get_android_jni_fd(handle);
+		if (fd >= 0) {
+			/* This fd is owned by the Java UsbDeviceConnection object
+			 * (hpriv->android_jni_connection, set inside
+			 * get_android_jni_fd()), not by us -- op_close() would
+			 * otherwise still close(hpriv->fd) directly (fd_keep only
+			 * ever gets set by op_wrap_sys_device(), a different path)
+			 * right before also calling android_jni_disconnect(),
+			 * whose connection.close() closes this exact same fd again
+			 * internally. Android reissues freed fd numbers immediately,
+			 * so that double-close doesn't just no-op: it can (and did,
+			 * reproducibly) close whatever unrelated fd -- a GPU sync
+			 * object, in one observed case -- got that number in
+			 * between, corrupting or crashing a completely different
+			 * subsystem instead of harmlessly failing on an already-
+			 * closed fd. */
+			struct linux_device_handle_priv *hpriv = usbi_get_device_handle_priv(handle);
+			hpriv->fd_keep = 1;
+		}
+	}
 #endif
 
 	if (fd < 0)

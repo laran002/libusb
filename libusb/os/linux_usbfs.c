@@ -107,6 +107,7 @@ static int android_jni_scan_devices(struct libusb_context *ctx);
  * LIBUSB_OPTION_ANDROID_JNIENV/_JAVAVM handling below. */
 static JavaVM *javaVm = NULL;
 #endif
+static void linux_device_disconnected_locked(uint8_t busnum, uint8_t devaddr);
 
 /* Serialize scan-devices, event-thread, and poll */
 usbi_mutex_static_t linux_hotplug_lock = USBI_MUTEX_INITIALIZER;
@@ -644,10 +645,13 @@ static int android_jni_scan_devices(struct libusb_context *ctx)
 	android_jni_devices_free(devices);
 
 	/* Anything still unseen was known before this scan but didn't show
-	 * up in it this time -- gone. */
+	 * up in it this time -- gone. linux_device_disconnected_locked(), not
+	 * linux_device_disconnected() -- op_hotplug_poll() (our only caller)
+	 * already holds active_contexts_lock across this whole scan; see that
+	 * helper's own comment for why relocking it here would deadlock. */
 	for (i = 0; i < known_count; i++) {
 		if (!known[i].seen)
-			linux_device_disconnected(known[i].busnum, known[i].devaddr);
+			linux_device_disconnected_locked(known[i].busnum, known[i].devaddr);
 	}
 
 	return LIBUSB_SUCCESS;
@@ -1483,13 +1487,25 @@ void linux_hotplug_enumerate(uint8_t busnum, uint8_t devaddr, const char *sys_na
 	usbi_mutex_static_unlock(&active_contexts_lock);
 }
 
-void linux_device_disconnected(uint8_t busnum, uint8_t devaddr)
+/* Caller must already hold active_contexts_lock. Split out of
+ * linux_device_disconnected() below so android_jni_scan_devices() -- always
+ * called from op_hotplug_poll() with that lock already held for the whole
+ * for_each_context() iteration -- can report a device gone without
+ * relocking it: active_contexts_lock is a plain, non-recursive mutex, so
+ * that second lock attempt would self-deadlock the calling thread forever
+ * instead of erroring. Confirmed via a captured tombstone: op_hotplug_poll()
+ * -> android_jni_scan_devices() -> (what was) linux_device_disconnected()
+ * blocked in pthread_mutex_lock() on active_contexts_lock, already held by
+ * the same thread. Only android_jni_scan_devices() (Android-only) calls
+ * this directly -- every other caller (linux_netlink.c, linux_udev.c, the
+ * op_open()/POLLERR paths below) runs on its own thread without the lock
+ * already held, so they keep going through the locking entry point. */
+static void linux_device_disconnected_locked(uint8_t busnum, uint8_t devaddr)
 {
 	struct libusb_context *ctx;
 	struct libusb_device *dev;
 	unsigned long session_id = busnum << 8 | devaddr;
 
-	usbi_mutex_static_lock(&active_contexts_lock);
 	for_each_context(ctx) {
 		dev = usbi_get_device_by_session_id(ctx, session_id);
 		if (dev) {
@@ -1499,6 +1515,12 @@ void linux_device_disconnected(uint8_t busnum, uint8_t devaddr)
 			usbi_dbg(ctx, "device not found for session %lx", session_id);
 		}
 	}
+}
+
+void linux_device_disconnected(uint8_t busnum, uint8_t devaddr)
+{
+	usbi_mutex_static_lock(&active_contexts_lock);
+	linux_device_disconnected_locked(busnum, devaddr);
 	usbi_mutex_static_unlock(&active_contexts_lock);
 }
 

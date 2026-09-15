@@ -150,6 +150,14 @@ struct linux_device_priv {
 	int active_config; /* cache val for !sysfs_available  */
 #ifdef __ANDROID__
 	jobject android_jni_device;
+
+	/* Debounces android_jni_request_permission() (see get_android_jni_fd()
+	 * below) -- zero-initialized by usbi_alloc_device()'s calloc(), so the
+	 * very first request always goes through. libusb has no way to learn
+	 * the async result of a request it already sent (that's necessarily
+	 * app-side -- see QUSB::UsbPermission), so this can only ever be a
+	 * best-effort debounce, not a real "already answered" latch. */
+	struct timespec android_jni_permission_requested_at;
 #endif
 };
 
@@ -671,8 +679,47 @@ static int get_android_jni_fd(struct libusb_device_handle *handle)
 	r = android_jni_connect(cpriv->android_jni, priv->android_jni_device,
 		&hpriv->android_jni_connection, &fd, &descriptors, &descriptors_len);
 	if (r != LIBUSB_SUCCESS) {
-		if (r == LIBUSB_ERROR_ACCESS)
-			android_jni_request_permission(cpriv->android_jni, priv->android_jni_device);
+		if (r == LIBUSB_ERROR_ACCESS) {
+			struct timespec now;
+			long elapsed_ms;
+
+			usbi_get_monotonic_time(&now);
+			elapsed_ms = (now.tv_sec - priv->android_jni_permission_requested_at.tv_sec) * 1000L
+				+ (now.tv_nsec - priv->android_jni_permission_requested_at.tv_nsec) / 1000000L;
+
+			/* Debounce, not a real "already answered" check (see this
+			 * field's own comment) -- without it, two independent
+			 * libusb_open() calls for the same device hitting ACCESS
+			 * within the same poll tick each fire their own request, and
+			 * asking again while one's still outstanding can resolve the
+			 * first as an immediate, spurious denial instead of the real
+			 * answer -- observed in practice taking up to ~1.5s to arrive
+			 * normally. 2s comfortably covers that gap without
+			 * meaningfully delaying a genuine retry once it's actually
+			 * needed. A caller that only ever opens a device from one
+			 * place (qusb's own demo app does, see Controller's class
+			 * comment) can't hit this race at all, but libusb has no way
+			 * to know that of an arbitrary consumer, so this stays a
+			 * library-level guard rather than something pushed onto
+			 * callers to get right themselves. */
+			if (elapsed_ms >= 2000) {
+				/* A temporary usbi_dbg() right here (logging elapsed_ms
+				 * whenever a request actually fired, as opposed to being
+				 * debounced away) is what let a captured logcat be
+				 * correlated against UsbPermissionReceiver.onReceive()'s
+				 * own temporary log (see its comment) by timestamp --
+				 * confirming a permissionResult(false) was arriving too
+				 * soon after the matching request to be a real answer,
+				 * which is what led to finding android_jni_request_
+				 * permission()'s FLAG_IMMUTABLE bug. Worth reinstating
+				 * the same way if a permission-dialog timing complaint
+				 * shows up again and it's unclear whether this debounce,
+				 * the qusb-side latch in usbpermission.cpp, or Android
+				 * itself is responsible. */
+				android_jni_request_permission(cpriv->android_jni, priv->android_jni_device);
+				priv->android_jni_permission_requested_at = now;
+			}
+		}
 		return r;
 	}
 

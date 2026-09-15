@@ -64,6 +64,7 @@ struct android_jni_context
 	int Build__VERSION__SDK_INT;
 	int Build__VERSION_CODES__M;
 	int Build__VERSION_CODES__P;
+	int Build__VERSION_CODES__S;
 	jmethodID Intent_init;
 	jmethodID PackageManager_hasSystemFeature;
 	jmethodID PendingIntent__getBroadcast;
@@ -476,16 +477,24 @@ int android_jni_request_permission(struct android_jni_context *jni,
 		return r;
 
 	/* From API 31 (S) onwards, PendingIntent.getBroadcast() requires
-	 * either FLAG_IMMUTABLE or FLAG_MUTABLE to be set, or it throws.
-	 * FLAG_IMMUTABLE itself only exists since API 23 (M); look it up by
-	 * reflection instead of hardcoding its value so this still runs on
-	 * pre-M devices, where passing 0 is correct. */
-	if (jni->Build__VERSION__SDK_INT >= jni->Build__VERSION_CODES__M) {
-		jfieldID flag_immutable_field_id = (*jni_env)->GetStaticFieldID(
-			jni_env, jni->PendingIntent, "FLAG_IMMUTABLE", "I");
-		if (flag_immutable_field_id != NULL) {
+	 * either FLAG_IMMUTABLE or FLAG_MUTABLE to be set, or it throws. This
+	 * PendingIntent specifically needs FLAG_MUTABLE, not FLAG_IMMUTABLE:
+	 * UsbManager.requestPermission() answers by calling Intent.fillIn()
+	 * on the intent this PendingIntent wraps, to attach EXTRA_DEVICE and
+	 * EXTRA_PERMISSION_GRANTED before broadcasting it -- fillIn() on an
+	 * immutable PendingIntent is silently blocked, so the broadcast still
+	 * arrives (matching this action) but with neither extra attached,
+	 * which UsbPermissionReceiver.java can't tell apart from a real
+	 * denial (confirmed via a captured logcat: onReceive() logged
+	 * granted=false device=null, not the user's actual answer). Below
+	 * API 31, passing 0 is correct -- PendingIntents were mutable by
+	 * default and fillIn() always worked. */
+	if (jni->Build__VERSION__SDK_INT >= jni->Build__VERSION_CODES__S) {
+		jfieldID flag_mutable_field_id = (*jni_env)->GetStaticFieldID(
+			jni_env, jni->PendingIntent, "FLAG_MUTABLE", "I");
+		if (flag_mutable_field_id != NULL) {
 			permission_intent_flags = (*jni_env)->GetStaticIntField(
-				jni_env, jni->PendingIntent, flag_immutable_field_id);
+				jni_env, jni->PendingIntent, flag_mutable_field_id);
 		}
 	}
 
@@ -824,6 +833,7 @@ static int android_jni_fill_ctx_ids(struct android_jni_context *jni,
 				Build__VERSION, "SDK_INT", "I"));
 	jni->Build__VERSION_CODES__M = 23;
 	jni->Build__VERSION_CODES__P = 28;
+	jni->Build__VERSION_CODES__S = 31;
 
 	Intent = (*jni_env)->FindClass(jni_env, "android/content/Intent");
 	jni->Intent = (*jni_env)->NewGlobalRef(jni_env, Intent);
